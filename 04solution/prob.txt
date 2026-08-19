@@ -1,0 +1,563 @@
+Q1. What Is the Lifetime of a DbContext, and Why Does It Matter?
+
+Answer:
+DbContext is generally registered with a Scoped lifetime in ASP.NET Core.
+
+A Scoped DbContext means one DbContext instance is created for each HTTP request. All services that depend on that DbContext within the same request normally share the same instance.
+
+Example:
+
+services.AddDbContext<AppDbContext>(options =>
+options.UseSqlServer(connectionString));
+
+The lifetime matters because DbContext is not designed to be shared across multiple threads or used for a long period of time.
+
+A DbContext:
+
+* Is intended for a short unit of work.
+* Tracks changes to entities.
+* Maintains a change tracker.
+* Is not thread-safe.
+* Should normally be disposed after the unit of work is finished.
+
+For example, during one HTTP request:
+
+Request
+|
++--> DbContext
+|
++--> Repository
+|
++--> Service
+|
++--> SaveChanges()
+|
++--> Request ends
+|
++--> DbContext disposed
+
+Interview Answer:
+"DbContext is normally registered as Scoped in ASP.NET Core, which means one instance is created per HTTP request. This is important because DbContext is designed for a short unit of work, maintains entity tracking state, and is not thread-safe. We should avoid sharing the same DbContext across requests or concurrent operations."
+
+Q2. You Inject DbContext Into a Singleton Background Service and Get Random Errors. What's Wrong?
+
+Answer:
+The problem is a lifetime mismatch.
+
+A BackgroundService is registered as a Singleton by default, while DbContext is normally Scoped.
+
+For example:
+
+services.AddDbContext<AppDbContext>(...);
+services.AddHostedService<MyBackgroundService>();
+
+MyBackgroundService is Singleton.
+
+If we directly inject:
+
+public class MyBackgroundService : BackgroundService
+{
+private readonly AppDbContext _context;
+
+```
+public MyBackgroundService(AppDbContext context)
+{
+    _context = context;
+}
+```
+
+}
+
+we are trying to use a Scoped service inside a Singleton.
+
+This is problematic because:
+
+* The DbContext can live much longer than intended.
+* The DbContext may be reused across multiple operations.
+* DbContext is not thread-safe.
+* Concurrent operations can cause errors.
+* The change tracker can grow over time.
+* The DbContext may become stale.
+
+The correct approach is to create a scope inside the BackgroundService and resolve the DbContext from that scope.
+
+Example:
+
+public class MyBackgroundService : BackgroundService
+{
+private readonly IServiceScopeFactory _scopeFactory;
+
+```
+public MyBackgroundService(IServiceScopeFactory scopeFactory)
+{
+    _scopeFactory = scopeFactory;
+}
+
+protected override async Task ExecuteAsync(CancellationToken stoppingToken)
+{
+    using IServiceScope scope = _scopeFactory.CreateScope();
+
+    AppDbContext context =
+        scope.ServiceProvider.GetRequiredService<AppDbContext>();
+
+    // Use context here
+}
+```
+
+}
+
+For repeated background work, create a new scope for each unit of work.
+
+Interview Answer:
+"The problem is a lifetime mismatch. BackgroundService is a Singleton, while DbContext is Scoped and is not thread-safe. I should not inject the DbContext directly into the Singleton. Instead, I create an IServiceScope inside the background service and resolve a new DbContext from that scope for each unit of work."
+
+Q3. What's the Difference Between AddDbContext and AddDbContextPool?
+
+Answer:
+Both register a DbContext with dependency injection, but they handle DbContext instances differently.
+
+AddDbContext:
+
+services.AddDbContext<AppDbContext>(options =>
+options.UseSqlServer(connectionString));
+
+A normal DbContext instance is created when requested within the scope and disposed when the scope ends.
+
+AddDbContextPool:
+
+services.AddDbContextPool<AppDbContext>(options =>
+options.UseSqlServer(connectionString));
+
+DbContext pooling allows EF Core to reuse DbContext instances instead of creating a completely new instance every time.
+
+Conceptually:
+
+AddDbContext:
+
+Request 1 -> Create DbContext -> Dispose
+Request 2 -> Create DbContext -> Dispose
+Request 3 -> Create DbContext -> Dispose
+
+DbContext Pool:
+
+Request 1 -> Get Context from Pool -> Return to Pool
+Request 2 -> Get Context from Pool -> Return to Pool
+Request 3 -> Get Context from Pool -> Return to Pool
+
+Pooling can reduce the overhead of repeatedly creating and disposing DbContext instances.
+
+However, pooled contexts require more care because the same context object can be reused between requests.
+
+You should not store request-specific state in a pooled DbContext that could leak into another use.
+
+Interview Answer:
+"AddDbContext creates normal scoped DbContext instances, while AddDbContextPool maintains a pool of DbContext instances and reuses them to reduce creation overhead. Pooling can improve performance in high-throughput applications, but the DbContext must be treated as short-lived and should not contain state that is specific to a particular request."
+
+Q4. What's the Difference Between IQueryable and IEnumerable in EF Core?
+
+Answer:
+The main difference is where the filtering and other operations happen.
+
+IQueryable represents a query that can be translated and executed by the data source, such as SQL Server.
+
+IEnumerable represents data that is being processed in memory.
+
+Example:
+
+IQueryable<User> users = context.Users;
+
+users = users.Where(x => x.Age > 18);
+
+At this point, the query has not necessarily executed yet.
+
+When we enumerate it:
+
+var result = await users.ToListAsync();
+
+EF Core translates the query into SQL and sends it to the database.
+
+Conceptually:
+
+IQueryable:
+
+C# query
+|
+v
+EF Core
+|
+v
+SQL
+|
+v
+Database
+|
+v
+Results
+
+IEnumerable:
+
+Database
+|
+v
+Load data
+|
+v
+C# memory
+|
+v
+Filter/process using C#
+
+For example:
+
+var users = await context.Users.ToListAsync();
+
+IEnumerable<User> result =
+users.Where(x => x.Age > 18);
+
+Here the filtering happens in memory because the database data has already been loaded.
+
+This can become a performance problem if the table contains millions of records.
+
+Interview Answer:
+"IQueryable represents a query that can be translated and executed by the underlying data source, while IEnumerable represents an in-memory sequence. With EF Core, IQueryable allows filtering and other operations to be translated into SQL and executed by the database. Once the data is materialized using methods such as ToListAsync, further LINQ operations generally run in memory."
+
+Q5. Your .Where() Throws "Could Not Be Translated". What Happened and How Do You Fix It?
+
+Answer:
+This usually means EF Core could not translate the C# expression inside the query into SQL.
+
+For example:
+
+var users = await context.Users
+.Where(x => MyCustomMethod(x.Name))
+.ToListAsync();
+
+EF Core has to convert:
+
+MyCustomMethod(x.Name)
+
+into SQL.
+
+If it doesn't know how to translate that method, it cannot execute the expression in the database.
+
+The solution depends on the situation.
+
+Option 1: Rewrite the expression using something EF Core can translate.
+
+For example:
+
+var users = await context.Users
+.Where(x => x.Name.StartsWith("A"))
+.ToListAsync();
+
+Option 2: Move the operation to memory intentionally.
+
+For example:
+
+var users = await context.Users
+.ToListAsync();
+
+var result = users
+.Where(x => MyCustomMethod(x.Name))
+.ToList();
+
+But this should be used carefully because it loads the data into memory first.
+
+Another option is to use AsEnumerable():
+
+var result = context.Users
+.AsEnumerable()
+.Where(x => MyCustomMethod(x.Name));
+
+Again, this changes the remaining query processing to client-side processing.
+
+The important thing is not to blindly switch to client-side evaluation because it can cause huge amounts of data to be loaded from the database.
+
+Interview Answer:
+"The error means EF Core cannot translate part of my LINQ expression into SQL. I first try to rewrite the expression using EF Core-translatable operations. If the operation genuinely has to run in C#, I materialize or switch to client-side processing intentionally, but only after limiting the data returned from the database to avoid performance problems."
+
+Q6. What's the Difference Between First, Single, and Find?
+
+Answer:
+
+1. First()
+
+First returns the first element that matches the condition.
+
+Example:
+
+var user = await context.Users
+.FirstAsync(x => x.Id == 10);
+
+If no matching element exists, First throws an exception.
+
+FirstOrDefault returns the first element or null/default if nothing is found.
+
+2. Single()
+
+Single expects exactly one matching element.
+
+Example:
+
+var user = await context.Users
+.SingleAsync(x => x.Email == email);
+
+If:
+
+* 0 elements match -> exception
+* 1 element matches -> returns it
+* More than 1 element matches -> exception
+
+Single is useful when the application expects the data to be unique.
+
+3. Find()
+
+Find is specifically designed to find an entity by its primary key.
+
+Example:
+
+var user = await context.Users.FindAsync(10);
+
+Find has an important advantage: EF Core first checks the DbContext's change tracker.
+
+If the entity is already being tracked, EF Core can return it without querying the database.
+
+Conceptually:
+
+Find()
+|
++--> Is entity already tracked?
+|
++--> Yes -> Return tracked entity
+|
++--> No -> Query database
+
+Summary:
+
+First:
+Returns first matching record.
+
+Single:
+Requires exactly one matching record.
+
+Find:
+Looks up an entity by primary key and checks the change tracker first.
+
+Interview Answer:
+"First returns the first matching entity and throws if none exists. Single expects exactly one matching entity and throws if there are zero or multiple matches. Find is specifically for primary-key lookups and first checks the DbContext change tracker before querying the database."
+
+Q7. Lazy, Eager, or Explicit Loading - What's the Default in EF Core?
+
+Answer:
+By default, EF Core does not automatically load related entities.
+
+In other words, related data is not loaded automatically unless you configure or request it.
+
+There are three common approaches.
+
+1. Eager Loading
+
+Use Include():
+
+var users = await context.Users
+.Include(x => x.Orders)
+.ToListAsync();
+
+The related Orders are loaded as part of the query.
+
+2. Explicit Loading
+
+You manually tell EF Core to load the relationship.
+
+Example:
+
+var user = await context.Users
+.FindAsync(10);
+
+await context.Entry(user)
+.Collection(x => x.Orders)
+.LoadAsync();
+
+3. Lazy Loading
+
+Related data is loaded automatically when you access the navigation property.
+
+Lazy loading is not enabled by default in EF Core.
+
+It must be configured, commonly using the EF Core lazy-loading proxies package and configuration.
+
+Interview Answer:
+"EF Core does not enable lazy loading by default. Related data must be explicitly requested using eager loading with Include, explicit loading through the DbContext Entry API, or lazy loading if it has been configured. In most applications, eager loading or projection is preferred because the database queries are more explicit."
+
+Q8. Why Is Lazy Loading Considered Dangerous in a Web API?
+
+Answer:
+Lazy loading can cause unexpected database queries when accessing navigation properties.
+
+For example:
+
+var users = await context.Users.ToListAsync();
+
+foreach (var user in users)
+{
+Console.WriteLine(user.Orders.Count);
+}
+
+If lazy loading is enabled, accessing:
+
+user.Orders
+
+can trigger another database query.
+
+If there are 100 users, this can result in:
+
+1 query to load users
++
+100 queries to load orders
+
+This is known as the N+1 query problem.
+
+Conceptually:
+
+Get Users
+|
++--> Query 1
+|
++--> User 1 Orders -> Query 2
++--> User 2 Orders -> Query 3
++--> User 3 Orders -> Query 4
+...
++--> User 100 Orders -> Query 101
+
+This can seriously hurt API performance.
+
+It can also make database access difficult to predict because simply accessing a property may execute a database query.
+
+Interview Answer:
+"Lazy loading can be dangerous in Web APIs because accessing navigation properties can silently trigger additional database queries. This can easily create the N+1 query problem, where one query loads the main entities and additional queries are executed for each entity. For predictable performance, I generally prefer projection or carefully controlled eager loading."
+
+Q9. When Do You Use Include Versus a Projection?
+
+Answer:
+
+Use Include when you actually need entities and their related entities.
+
+Example:
+
+var users = await context.Users
+.Include(x => x.Orders)
+.ToListAsync();
+
+This is useful when you need the User entities and their Orders, perhaps because you are going to modify tracked entities.
+
+Use projection when you only need specific data.
+
+Example:
+
+var result = await context.Users
+.Select(x => new UserDto
+{
+Id = x.Id,
+Name = x.Name,
+OrderCount = x.Orders.Count
+})
+.ToListAsync();
+
+Instead of loading complete User and Order entities, EF Core can select only the data required by the API.
+
+Projection is often preferable for Web APIs because:
+
+* It retrieves only required columns.
+* It reduces the amount of data transferred.
+* It avoids unnecessary entity tracking when used appropriately.
+* It maps naturally to DTOs.
+* It can improve query performance.
+
+Example:
+
+Using Include:
+
+User
+|
++--> Id
++--> Name
++--> Email
++--> Other fields
+|
++--> Orders
+|
++--> All required Order fields
+
+Using projection:
+
+DTO
+|
++--> Id
++--> Name
++--> OrderCount
+
+Interview Answer:
+"I use Include when I need the actual entity graph and potentially need to work with tracked entities. I prefer projection when I only need specific data, especially for Web API responses. Projection allows EF Core to select only the required columns and maps well to DTOs, which can reduce memory usage and database/network overhead."
+
+Q10. When Do You Use AsNoTracking, and What's the Catch?
+
+Answer:
+AsNoTracking is used when I only need to read data and don't intend to modify and save those entities through that DbContext.
+
+Example:
+
+var users = await context.Users
+.AsNoTracking()
+.ToListAsync();
+
+Normally, EF Core tracks entities returned from a query.
+
+Tracking means EF Core keeps information about the entities so it can detect changes.
+
+For example:
+
+var user = await context.Users
+.FirstAsync(x => x.Id == 10);
+
+user.Name = "John";
+
+await context.SaveChangesAsync();
+
+EF Core knows that the User changed because it is tracking the entity.
+
+With:
+
+var user = await context.Users
+.AsNoTracking()
+.FirstAsync(x => x.Id == 10);
+
+the entity is not tracked.
+
+This can be beneficial for read-only queries because EF Core doesn't need to maintain tracking information.
+
+Common use cases:
+
+* GET endpoints
+* Reports
+* Dashboards
+* Read-only queries
+* Large result sets that don't need updates
+
+The catch is that if you later modify the entity and call SaveChanges(), EF Core is not automatically tracking the changes.
+
+For example:
+
+var user = await context.Users
+.AsNoTracking()
+.FirstAsync(x => x.Id == 10);
+
+user.Name = "John";
+
+await context.SaveChangesAsync();
+
+The change will not automatically be detected because the entity isn't being tracked.
+
+If you need to update it, you can explicitly attach/update it or simply query it normally when appropriate.
+
+Interview Answer:
+"I use AsNoTracking for read-only queries, especially in Web API GET endpoints and large result sets, because EF Core doesn't need to maintain change-tracking information. The trade-off is that changes to those entities are not automatically detected by SaveChanges. If I need to update the entity, I either use a tracking query or explicitly attach/update the entity."
